@@ -18,7 +18,11 @@ function saml_checker() {
 	$saml_metadata        = apply_filters( 'onelogin_saml_metadata', 'saml_metadata' );
 	$saml_validate_config = apply_filters( 'onelogin_saml_validate_config', 'saml_validate_config' );
 
-	if ( isset( $_GET[ $saml_acs ] ) ) {
+	if (isset($_GET['saml_acs'])) {
+		if (empty($_POST['SAMLResponse'])) {
+			echo "That ACS endpoint expects a SAMLResponse value sent using HTTP-POST binding. Nothing was found";
+			exit();
+		}
 		saml_acs();
 	}
 	else if (isset($_GET[ $saml_sls ])) {
@@ -36,7 +40,7 @@ function saml_custom_login_footer() {
 		$saml_login_message = "SAML Login";
 	}
 
-    echo '<div style="font-size: 110%;padding:8px;background: #fff;text-align: center;"><a href="'.get_site_url().'/wp-login.php?saml_sso">'.$saml_login_message.'</a></div>';
+    echo '<div style="font-size: 110%;padding:8px;background: #fff;text-align: center;"><a href="'.get_site_url().'/wp-login.php?saml_sso">'.esc_html($saml_login_message).'</a></div>';
 }
 
 function saml_load_translations() {
@@ -64,6 +68,10 @@ function saml_user_register() {
 }
 
 function saml_sso() {
+	if ( defined( 'WP_CLI' ) && WP_CLI ) {
+		return true;
+	}
+	
 	if (is_user_logged_in()) {
 		return true;
 	}
@@ -86,15 +94,20 @@ function saml_slo() {
 		} else {
 			$nameId = null;
 			$sessionIndex = null;
+			$nameIdFormat = null;
+
 			if (isset($_COOKIE['saml_nameid'])) {
 				$nameId = $_COOKIE['saml_nameid']; 
 			}
 			if (isset($_COOKIE['saml_sessionindex'])) {
 				$sessionIndex = $_COOKIE['saml_sessionindex'];
 			}
-			
+			if (isset($_COOKIE['saml_nameid_format'])) {
+				$nameIdFormat = $_COOKIE['saml_nameid_format'];
+			}
+
 			$auth = initialize_saml();
-			$auth->logout(home_url(), array(), $nameId, $sessionIndex);
+			$auth->logout(home_url(), array(), $nameId, $sessionIndex, false, $nameIdFormat);
 			return false;
 		}
 	}
@@ -137,13 +150,16 @@ function saml_acs() {
 	$errors = $auth->getErrors();
 	if (!empty($errors)) {
 		echo '<br>'.__("There was at least one error processing the SAML Response").': ';
-		echo implode("<br>", $errors);
-		echo '<br>'.__("Contact the administrator");
+		foreach($errors as $error) {
+			echo esc_html($error).'<br>';
+		}
+		echo __("Contact the administrator");
 		exit();
 	}
 
 	setcookie('saml_nameid', $auth->getNameId(), time() + YEAR_IN_SECONDS, SITECOOKIEPATH );
 	setcookie('saml_sessionindex', $auth->getSessionIndex(), time() + YEAR_IN_SECONDS, SITECOOKIEPATH );
+	setcookie('saml_nameid_format', $auth->getNameIdFormat(), time() + YEAR_IN_SECONDS, SITECOOKIEPATH );
 
 	$attrs = $auth->getAttributes();
 
@@ -254,19 +270,21 @@ function saml_acs() {
 		}
 	} else if (get_option('onelogin_saml_autocreate')) {
 		if (!validate_username($username)) {
-			echo __("The username provided by the IdP"). ' "'. $username. '" '. __("is not valid and can't create the user at wordpress");
+			echo __("The username provided by the IdP"). ' "'. esc_attr($username). '" '. __("is not valid and can't create the user at wordpress");
 			exit();
 		}
 		$userdata['user_pass'] = wp_generate_password();
 		$user_id = wp_insert_user($userdata);
 	} else {
-		echo __("User provided by the IdP "). ' "'. $matcherValue. '" '. __("does not exist in wordpress and auto-provisioning is disabled.");
+		echo __("User provided by the IdP "). ' "'. esc_attr($matcherValue). '" '. __("does not exist in wordpress and auto-provisioning is disabled.");
 		exit();
 	}
 
 	if (is_a($user_id, 'WP_Error')) {
-		$error = $user_id->get_error_messages();
-		echo implode('<br>', $error);
+		$errors = $user_id->get_error_messages();
+		foreach($errors as $error) {
+			echo esc_html($error).'<br>';
+		}
 		exit();
 	} else if ($user_id) {
 		wp_set_current_user($user_id);
@@ -311,6 +329,7 @@ function saml_sls() {
 		setcookie('saml_login', 0, time() - 3600, SITECOOKIEPATH );
 		setcookie('saml_nameid', null, time() - 3600, SITECOOKIEPATH );
 		setcookie('saml_sessionindex', null, time() - 3600, SITECOOKIEPATH );
+		setcookie('saml_nameid_format', null, time() - 3600, SITECOOKIEPATH );
 
 		if (get_option('onelogin_saml_forcelogin') && get_option('onelogin_saml_customize_stay_in_wordpress_after_slo')) {
 			wp_redirect(home_url().'/wp-login.php?loggedout=true');
@@ -324,18 +343,22 @@ function saml_sls() {
 		exit();
 	} else {
 		echo __("SLS endpoint found an error.");
-		echo implode("<br>", $errors);
+		foreach($errors as $error) {
+			echo esc_html($error).'<br>';
+		}
 		exit();
 	}
 }
 
 function saml_metadata() {
-	$auth = initialize_saml();
-	$settings = $auth->getSettings();
-	$metadata = $settings->getSPMetadata();
-	
+	require_once plugin_dir_path(__FILE__).'_toolkit_loader.php';
+	require plugin_dir_path(__FILE__).'settings.php';
+
+	$samlSettings = new OneLogin_Saml2_Settings($settings, true);
+	$metadata = $samlSettings->getSPMetadata();
+
 	header('Content-Type: text/xml');
-	echo $metadata;
+	echo ent2ncr($metadata);
 	exit();
 }
 
@@ -356,7 +379,7 @@ function initialize_saml() {
 		$auth = new Onelogin_Saml2_Auth($settings);
 	} catch (Exception $e) {
 		echo '<br>'.__("The Onelogin SSO/SAML plugin is not correctly configured.", 'onelogin-saml-sso').'<br>';
-		print_r($e->getMessage());
+		echo esc_html($e->getMessage());
 		echo '<br>'.__("If you are the administrator", 'onelogin-saml-sso').', <a href="'.get_site_url().'/wp-login.php?normal">'.__("access using your wordpress credentials", 'onelogin-saml-sso').'</a> '.__("and fix the problem", 'onelogin-saml-sso');
 		exit();
 	}
